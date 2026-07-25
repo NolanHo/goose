@@ -2,8 +2,8 @@
 /**
  * ACP Gateway — a proxy between ACP clients (Web/桌面) and goosed.
  *
- *   Client A (ws + permessage-deflate) ─┐
- *   Client B (ws + permessage-deflate) ─┼──→ Gateway (:39249) ──→ goosed (:39247)
+ *   Client A (ws + perMessage-deflate) ─┐
+ *   Client B (ws + perMessage-deflate) ─┼──→ Gateway (:39249) ──→ goosed (:39247)
  *                                       │     (1 upstream WS)      (persistent)
  *
  * Three capabilities goosed's ACP server doesn't provide:
@@ -15,11 +15,13 @@
  *    goosed stays open, so an in-flight prompt is NOT aborted.  On reconnect
  *    the client reloads the session; goosed replays from its database.
  *
- * 3. **Fan-out** — goosed messages are broadcast to every connected client.
+ * 3. **Fan-out** — goosed *notifications* are broadcast to every connected
+ *    client.  JSON-RPC *responses* (which carry a request `id`) are routed
+ *    only to the client that sent the matching request.
  *
- * The gateway is stateless: it does not buffer messages, maintain session
- * state, or deduplicate.  Only `initialize` is intercepted (goosed accepts one
- * per WS connection); subsequent clients receive the cached response.
+ * The gateway is stateless regarding session data: it does not buffer messages
+ * or maintain session state.  Only `initialize` is intercepted (goosed accepts
+ * one per WS connection); subsequent clients receive the cached response.
  *
  * Implementation note: the upstream WS uses Node's built-in global WebSocket
  * (undici), NOT the `ws` library.  The `ws` library's WSServer with
@@ -62,6 +64,12 @@ const upstreamQueue = [];          // messages buffered before upstream opens
 let initResponse = null;           // cached { ...goosed init response }
 /** Set of connected downstream clients (ws library). */
 const clients = new Set();
+/**
+ * Maps JSON-RPC request id → client that sent it.
+ * Used to route responses back to the originating client (not broadcast).
+ * Notifications (no id) are broadcast to all.
+ */
+const requestOwner = new Map();
 
 // --- Upstream (goosed) ------------------------------------------------------
 
@@ -98,10 +106,24 @@ function connectUpstream() {
       } catch { /* not JSON */ }
     }
 
-    // Fan-out: forward to every connected client.
-    for (const client of clients) {
-      if (client.readyState === 1 /* OPEN */) {
-        client.send(data);
+    // Route: responses (has id, no method) → originating client only.
+    //        notifications (has method) → broadcast to all clients.
+    let parsed = null;
+    try { parsed = JSON.parse(data); } catch { /* not JSON, broadcast */ }
+
+    if (parsed && parsed.id !== undefined && !parsed.method) {
+      // JSON-RPC response — route to the client that sent the request.
+      const owner = requestOwner.get(parsed.id);
+      if (owner && owner.readyState === 1 /* OPEN */) {
+        owner.send(data);
+      }
+      requestOwner.delete(parsed.id);
+    } else {
+      // Notification or unparseable — broadcast to all clients.
+      for (const client of clients) {
+        if (client.readyState === 1 /* OPEN */) {
+          client.send(data);
+        }
       }
     }
   });
@@ -115,7 +137,6 @@ function connectUpstream() {
   });
 
   upstream.addEventListener('error', (event) => {
-    // 'close' fires after error; log only.
     console.error('[gateway] upstream error:', event.message || event.type);
   });
 }
@@ -145,13 +166,18 @@ wss.on('connection', (ws) => {
   console.log(`[gateway] Client connected (${clients.size} total)`);
 
   ws.on('message', (data) => {
+    const str = data.toString();
     let msg;
     try {
-      msg = JSON.parse(data.toString());
+      msg = JSON.parse(str);
     } catch {
-      // Not JSON-RPC — forward raw.
-      sendUpstream(data.toString());
+      sendUpstream(str);
       return;
+    }
+
+    // Track request ownership for response routing.
+    if (msg.id !== undefined && msg.method) {
+      requestOwner.set(msg.id, ws);
     }
 
     // Intercept initialize: goosed only accepts one per WS connection.
@@ -159,16 +185,21 @@ wss.on('connection', (ws) => {
     if (msg.method === 'initialize') {
       if (initResponse) {
         ws.send(JSON.stringify({ ...initResponse, id: msg.id }));
+        requestOwner.delete(msg.id);
         return;
       }
       // First time — forward to goosed (response will be cached upstream).
     }
 
-    sendUpstream(data.toString());
+    sendUpstream(str);
   });
 
   ws.on('close', () => {
     clients.delete(ws);
+    // Clean up any pending requests owned by this client.
+    for (const [id, owner] of requestOwner) {
+      if (owner === ws) requestOwner.delete(id);
+    }
     console.log(`[gateway] Client disconnected (${clients.size} remaining) — upstream kept alive`);
   });
 
