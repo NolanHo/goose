@@ -149,9 +149,14 @@ function bufferNotification(sessionId, notification) {
 
 /** Forward a goosed notification to all browsers subscribed to a session. */
 function routeNotification(sessionId, method, params) {
-  bufferNotification(sessionId, { method, params });
   const subs = subscribers.get(sessionId);
-  if (!subs) return;
+  // Buffer only when no live subscriber exists (the disconnect-window case
+  // the buffer is for). Otherwise goosed's own loadSession replay already
+  // delivers the history — buffering would duplicate it.
+  if (!subs || subs.size === 0) {
+    bufferNotification(sessionId, { method, params });
+    return;
+  }
   for (const conn of subs) {
     if (conn._closed) continue;
     if (method === 'session/update') conn._agent.sessionUpdate(params);
@@ -168,12 +173,19 @@ async function routeRequest(sessionId, fn) {
   const subs = subscribers.get(sessionId);
   if (!subs) return { outcome: { outcome: 'cancelled' } };
   for (const conn of subs) {
-    if (!conn._closed) return await fn(conn._agent);
+    if (conn._closed) continue;
+    try {
+      return await fn(conn._agent);
+    } catch {
+      // Browser disconnected mid-RPC — treat like "no browser" (cancelled).
+      return { outcome: { outcome: 'cancelled' } };
+    }
   }
   return { outcome: { outcome: 'cancelled' } };
 }
 
 function connectUpstream() {
+  if (!TOKEN) console.warn('[gateway] WARNING: VITE_GOOSE_TOKEN is empty — upstream will 401');
   if (upstream && upstreamReady) return;
 
   const url = `ws://${GOOSED_HOST}:${GOOSED_PORT}/acp?token=${encodeURIComponent(TOKEN)}`;
@@ -187,9 +199,22 @@ function connectUpstream() {
       const sid = params?.sessionId;
       if (sid) routeNotification(sid, 'session/update', params);
     },
-    unstable_sessionUpdate(params) {
-      const sid = params?.sessionId;
-      if (sid) routeNotification(sid, 'goose/sessionUpdate', params);
+    // Goose extensions: the raw ClientSideConnection dispatches unknown methods
+    // to extMethod/extNotification (default branch). Route goose-specific ones
+    // to their named callbacks; mirror GooseClient's dispatchers.
+    extNotification(method, params) {
+      if (method === '_goose/unstable/session/update') {
+        const sid = params?.sessionId;
+        if (sid) routeNotification(sid, 'goose/sessionUpdate', params);
+      }
+    },
+    extMethod(method, params) {
+      if (method === '_goose/unstable/session/recipe/request-params') {
+        return routeRequest(params?.sessionId, (agent) =>
+          agent.extMethod('goose/sessionRecipeRequestParams', params)
+        );
+      }
+      throw new Error(`unhandled ext method: ${method}`);
     },
     // goosed → client requests (await browser response, or cancel if offline)
     requestPermission(params) {
@@ -198,14 +223,22 @@ function connectUpstream() {
     unstable_createElicitation(params) {
       return routeRequest(params?.sessionId, (agent) => agent.unstable_createElicitation(params));
     },
-    unstable_sessionRecipeRequestParams(params) {
-      return routeRequest(params?.sessionId, (agent) => agent.extMethod('goose/sessionRecipeRequestParams', params));
-    },
   });
 
   upstream = new ClientSideConnection(callbacks, upstreamStream);
   upstreamReady = true;
   console.log('[gateway] upstream connected');
+
+  // B2: reconnect when the upstream WS drops (goosed restart, network blip).
+  upstreamStream.ws.addEventListener('close', () => {
+    if (!upstreamReady) return; // already reconnecting
+    console.log('[gateway] upstream disconnected, reconnecting in 1s');
+    upstreamReady = false;
+    upstream = null;
+    cachedInit = null; // must re-initialize on the new connection
+    upstreamStream = null;
+    setTimeout(connectUpstream, 1000);
+  });
 }
 
 // --- Downstream Agent (per browser) ----------------------------------------
@@ -233,11 +266,10 @@ function createDownstreamAgent(conn) {
     loadSession: async (params) => {
       subscribe(params.sessionId, conn);
       const res = await upstream.loadSession(params);
-      // Replay buffered notifications before the loadSession replay arrives,
-      // so the browser sees recent activity immediately. loadSession provides
-      // the authoritative full history from goosed.
-      const buf = buffers.get(params.sessionId);
-      if (buf) for (const n of buf) conn._agent.extNotification(n.method, n.params);
+      // goosed's loadSession replays the full conversation history itself.
+      // Clear our buffer — it was only for the disconnect window, and
+      // replaying it now would duplicate goosed's authoritative replay.
+      buffers.delete(params.sessionId);
       return res;
     },
     // THE CORE: prompt is forwarded to the gateway's own upstream client.
@@ -252,6 +284,7 @@ function createDownstreamAgent(conn) {
     setSessionMode: fwd('setSessionMode'),
     setSessionConfigOption: fwd('setSessionConfigOption'),
     authenticate: fwd('authenticate'),
+    unstable_logout: fwd('unstable_logout'),
     // goose extensions + any unknown method → forward generically
     extMethod: (method, params) => upstream.extMethod(method, params),
     extNotification: (method, params) => upstream.extNotification(method, params),
