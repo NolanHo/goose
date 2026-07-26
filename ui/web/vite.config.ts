@@ -28,9 +28,11 @@ export default defineConfig({
     strictPort: true,
     // Allow access via reverse proxy / custom hostnames (e.g. goose.apeiria.cn).
     allowedHosts: true,
-    // Proxy auxiliary goosed routes (health/status). The ACP WebSocket goes
-    // through the gateway (:39249) directly — see src/shim.ts getAcpUrl.
+    // Proxy routes to goosed (:39247) and the ACP gateway (:39249).
+    //   /acp    — WebSocket through the gateway (persistent ACP client).
+    //   /health, /status — plain HTTP, no token required by goosed.
     proxy: {
+      '/acp': { target: 'ws://localhost:39249', ws: true },
       '/health': 'http://localhost:39247',
       '/status': 'http://localhost:39247',
     },

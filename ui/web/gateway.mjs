@@ -1,38 +1,43 @@
 #!/usr/bin/env node
 /**
- * ACP Gateway — a proxy between ACP clients (Web/桌面) and goosed.
+ * ACP Client Gateway
  *
- *   Client A (ws + perMessage-deflate) ─┐
- *   Client B (ws + perMessage-deflate) ─┼──→ Gateway (:39249) ──→ goosed (:39247)
- *                                       │     (1 upstream WS)      (persistent)
+ *   Browser (ws+deflate) ─┐                          ┌─ ClientSideConnection (ACP client, persistent)
+ *   Browser (ws+deflate) ─┼──→ Gateway (:39249) ─────┤   upstream WS → goosed (:39247, ?token=)
+ *                         │   AgentSideConnection   │   (undici global WebSocket)
+ *                         │   (ACP server, per-browser) │
+ *                         └──────────────────────────┘
  *
- * Three capabilities goosed's ACP server doesn't provide:
+ * Why this exists: ACP binds prompt execution to the WS connection. When the
+ * browser disconnects, goosed's Connection::shutdown() aborts the in-flight
+ * prompt. This gateway holds the prompt lifecycle itself — the browser's
+ * prompt call is forwarded to the gateway's OWN upstream client.prompt(),
+ * which keeps running regardless of whether any browser is connected.
  *
- * 1. **Compression** — downstream WS enables permessage-deflate.  ACP messages
- *    are JSON (~6% compression ratio); a 9 MB session replay drops to ~0.5 MB.
+ * Architecture:
+ *  - Upstream: ONE persistent ClientSideConnection to goosed (undici WebSocket,
+ *    start-mode stream). Holds prompt lifecycles; survives browser disconnect.
+ *  - Downstream: one AgentSideConnection per browser (ws library + deflate).
+ *    The Agent implementation forwards every method to the upstream client.
+ *  - Routing: goosed's session/update notifications + permission/elicitation
+ *    requests are routed to browsers subscribed to that session. Notifications
+ *    are also buffered so a reconnecting browser can replay recent activity
+ *    before loadSession replays the full history.
  *
- * 2. **Disconnect tolerance** — when a client disconnects the upstream WS to
- *    goosed stays open, so an in-flight prompt is NOT aborted.  On reconnect
- *    the client reloads the session; goosed replays from its database.
- *
- * 3. **Fan-out** — goosed *notifications* are broadcast to every connected
- *    client.  JSON-RPC *responses* (which carry a request `id`) are routed
- *    only to the client that sent the matching request.
- *
- * The gateway is stateless regarding session data: it does not buffer messages
- * or maintain session state.  Only `initialize` is intercepted (goosed accepts
- * one per WS connection); subsequent clients receive the cached response.
- *
- * Implementation note: the upstream WS uses Node's built-in global WebSocket
- * (undici), NOT the `ws` library.  The `ws` library's WSServer with
- * perMessageDeflate enabled interferes with same-process `ws` WebSocket clients
- * (on('message') never fires).  undici's WebSocket is unaffected.
+ * Upstream uses undici's global WebSocket (NOT the `ws` library) to avoid a
+ * conflict where `ws` WSServer (downstream, perMessageDeflate) silences
+ * on('message') for in-process `ws` WebSocket clients.
  */
 
-import { WebSocketServer } from 'ws';
+import wsPkg from '/vePFS-Mindverse/user/nolanho/code/goose/ui/node_modules/ws/index.js';
+const { WebSocketServer } = wsPkg;
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import {
+  ClientSideConnection,
+  AgentSideConnection,
+} from '/vePFS-Mindverse/user/nolanho/code/goose/ui/node_modules/@agentclientprotocol/sdk/dist/acp.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -45,7 +50,7 @@ function loadEnv() {
       if (m) process.env[`VITE_${m[1]}`] = m[2].trim();
     }
   } catch {
-    // .env is optional.
+    /* .env is optional */
   }
 }
 loadEnv();
@@ -54,158 +59,229 @@ const GOOSED_HOST = process.env.VITE_GOOSE_ACP_HOST || 'localhost';
 const GOOSED_PORT = process.env.VITE_GOOSE_ACP_PORT || '39247';
 const TOKEN = process.env.VITE_GOOSE_TOKEN || '';
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '39249', 10);
+const BUFFER_LIMIT = 500; // max notifications buffered per session
 
-// --- State ------------------------------------------------------------------
+// --- Stream adapters --------------------------------------------------------
+// Both adapters use the `start(controller)` pattern (matching the SDK's own
+// tests) — push messages via controller.enqueue, close/error via the controller.
 
-/** Persistent upstream WS to goosed (undici WebSocket). */
-let upstream = null;
-let upstreamReady = false;
-const upstreamQueue = [];          // messages buffered before upstream opens
-let initResponse = null;           // cached { ...goosed init response }
-/** Set of connected downstream clients (ws library). */
-const clients = new Set();
 /**
- * Maps JSON-RPC request id → client that sent it.
- * Used to route responses back to the originating client (not broadcast).
- * Notifications (no id) are broadcast to all.
+ * Upstream stream: undici global WebSocket → ACP Stream.
+ * goosed's /acp speaks text-frame JSON-RPC; undici returns string for text.
  */
-const requestOwner = new Map();
+function createUpstreamStream(url) {
+  const ws = new WebSocket(url);
+  let rc;
+  ws.addEventListener('message', (e) => {
+    if (typeof e.data !== 'string') return;
+    try { rc?.enqueue(JSON.parse(e.data)); } catch { /* malformed */ }
+  });
+  ws.addEventListener('close', () => { try { rc?.close(); } catch {} });
+  ws.addEventListener('error', () => { try { rc?.error(new Error('upstream ws')); } catch {} });
 
-// --- Upstream (goosed) ------------------------------------------------------
+  const openPromise = new Promise((resolve, reject) => {
+    ws.addEventListener('open', () => resolve(), { once: true });
+    ws.addEventListener('error', () => reject(new Error('upstream open failed')), { once: true });
+    ws.addEventListener('close', () => reject(new Error('upstream closed pre-open')), { once: true });
+  });
+
+  const readable = new ReadableStream({ start(c) { rc = c; } });
+  const writable = new WritableStream({
+    async write(msg) {
+      await openPromise;
+      if (ws.readyState !== 1) throw new Error('upstream not open');
+      ws.send(JSON.stringify(msg));
+    },
+  });
+  return { readable, writable, ws, close: () => ws.close() };
+}
+
+/**
+ * Downstream stream: ws-library WebSocket (from WSServer) → ACP Stream.
+ * perMessageDeflate is handled by the WSServer; messages arrive as Buffer.
+ */
+function createDownstreamStream(ws) {
+  let rc;
+  ws.on('message', (data) => {
+    try { rc?.enqueue(JSON.parse(data.toString())); } catch { /* malformed */ }
+  });
+  ws.on('close', () => { try { rc?.close(); } catch {} });
+  ws.on('error', () => { try { rc?.error(new Error('downstream ws')); } catch {} });
+
+  const readable = new ReadableStream({ start(c) { rc = c; } });
+  const writable = new WritableStream({
+    write(msg) { ws.send(JSON.stringify(msg)); },
+  });
+  return { readable, writable };
+}
+
+// --- Upstream (gateway → goosed) -------------------------------------------
+
+let upstream = null;            // ClientSideConnection
+let upstreamStream = null;      // { readable, writable, ws, close }
+let upstreamReady = false;
+let cachedInit = null;          // cached InitializeResponse
+
+// session-id → set of downstream connections subscribed to that session
+const subscribers = new Map();
+// session-id → array of buffered session/update notifications (for replay)
+const buffers = new Map();
+
+function subscribe(sessionId, conn) {
+  let set = subscribers.get(sessionId);
+  if (!set) { set = new Set(); subscribers.set(sessionId, set); }
+  set.add(conn);
+}
+function unsubscribeAll(conn) {
+  for (const [sid, set] of subscribers) {
+    set.delete(conn);
+    if (set.size === 0) subscribers.delete(sid);
+  }
+}
+
+/** Buffer a notification for a session (capped). */
+function bufferNotification(sessionId, notification) {
+  let buf = buffers.get(sessionId);
+  if (!buf) { buf = []; buffers.set(sessionId, buf); }
+  buf.push(notification);
+  if (buf.length > BUFFER_LIMIT) buf.splice(0, buf.length - BUFFER_LIMIT);
+}
+
+/** Forward a goosed notification to all browsers subscribed to a session. */
+function routeNotification(sessionId, method, params) {
+  bufferNotification(sessionId, { method, params });
+  const subs = subscribers.get(sessionId);
+  if (!subs) return;
+  for (const conn of subs) {
+    if (conn._closed) continue;
+    if (method === 'session/update') conn._agent.sessionUpdate(params);
+    else conn._agent.extNotification(method, params);
+  }
+}
+
+/**
+ * Route a goosed→client RPC request (permission/elicitation) to the browser
+ * subscribed to the session, and await its response. If no browser is online,
+ * return 'cancelled' so the agent isn't blocked forever.
+ */
+async function routeRequest(sessionId, fn) {
+  const subs = subscribers.get(sessionId);
+  if (!subs) return { outcome: { outcome: 'cancelled' } };
+  for (const conn of subs) {
+    if (!conn._closed) return await fn(conn._agent);
+  }
+  return { outcome: { outcome: 'cancelled' } };
+}
 
 function connectUpstream() {
-  if (upstream && (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+  if (upstream && upstreamReady) return;
 
   const url = `ws://${GOOSED_HOST}:${GOOSED_PORT}/acp?token=${encodeURIComponent(TOKEN)}`;
   console.log(`[gateway] Connecting to goosed ${GOOSED_HOST}:${GOOSED_PORT} ...`);
+  upstreamStream = createUpstreamStream(url);
 
-  // Global WebSocket = undici (NOT ws library).  This is the fix for the
-  // perMessageDeflate interference bug.
-  upstream = new WebSocket(url);
-
-  upstream.addEventListener('open', () => {
-    upstreamReady = true;
-    console.log('[gateway] goosed connected');
-    for (const msg of upstreamQueue) upstream.send(msg);
-    upstreamQueue.length = 0;
+  const callbacks = () => ({
+    // goosed → client: callbacks receive *params* directly (not a notification
+    // wrapper). Each carries sessionId for routing to subscribed browsers.
+    sessionUpdate(params) {
+      const sid = params?.sessionId;
+      if (sid) routeNotification(sid, 'session/update', params);
+    },
+    unstable_sessionUpdate(params) {
+      const sid = params?.sessionId;
+      if (sid) routeNotification(sid, 'goose/sessionUpdate', params);
+    },
+    // goosed → client requests (await browser response, or cancel if offline)
+    requestPermission(params) {
+      return routeRequest(params?.sessionId, (agent) => agent.requestPermission(params));
+    },
+    unstable_createElicitation(params) {
+      return routeRequest(params?.sessionId, (agent) => agent.unstable_createElicitation(params));
+    },
+    unstable_sessionRecipeRequestParams(params) {
+      return routeRequest(params?.sessionId, (agent) => agent.extMethod('goose/sessionRecipeRequestParams', params));
+    },
   });
 
-  upstream.addEventListener('message', (event) => {
-    const data = event.data; // string (ACP uses text frames)
-
-    // Cache the first initialize response.
-    if (!initResponse) {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.result && msg.result.protocolVersion !== undefined) {
-          initResponse = msg;
-          console.log('[gateway] Cached initialize response');
-        }
-      } catch { /* not JSON */ }
-    }
-
-    // Route: responses (has id, no method) → originating client only.
-    //        notifications (has method) → broadcast to all clients.
-    let parsed = null;
-    try { parsed = JSON.parse(data); } catch { /* not JSON, broadcast */ }
-
-    if (parsed && parsed.id !== undefined && !parsed.method) {
-      // JSON-RPC response — route to the client that sent the request.
-      const owner = requestOwner.get(parsed.id);
-      if (owner && owner.readyState === 1 /* OPEN */) {
-        owner.send(data);
-      }
-      requestOwner.delete(parsed.id);
-    } else {
-      // Notification or unparseable — broadcast to all clients.
-      for (const client of clients) {
-        if (client.readyState === 1 /* OPEN */) {
-          client.send(data);
-        }
-      }
-    }
-  });
-
-  upstream.addEventListener('close', () => {
-    console.log('[gateway] goosed disconnected, reconnecting in 1s');
-    upstreamReady = false;
-    upstream = null;
-    initResponse = null;
-    setTimeout(connectUpstream, 1000);
-  });
-
-  upstream.addEventListener('error', (event) => {
-    console.error('[gateway] upstream error:', event.message || event.type);
-  });
+  upstream = new ClientSideConnection(callbacks, upstreamStream);
+  upstreamReady = true;
+  console.log('[gateway] upstream connected');
 }
 
-function sendUpstream(data) {
-  if (!upstream) connectUpstream();
-  if (upstreamReady && upstream.readyState === WebSocket.OPEN) {
-    upstream.send(data);
-  } else {
-    upstreamQueue.push(data);
-  }
+// --- Downstream Agent (per browser) ----------------------------------------
+
+function createDownstreamAgent(conn) {
+  // Every method forwards to the persistent upstream client. The upstream
+  // WS stays open independently of this browser connection, so an in-flight
+  // prompt keeps running even after the browser disconnects.
+  const fwd = (method) => (params) => {
+    if (!upstream) throw new Error('upstream not connected');
+    return upstream[method](params);
+  };
+
+  return {
+    // initialize: goosed accepts one per WS connection. Cache + reuse.
+    initialize: async (params) => {
+      if (!cachedInit) cachedInit = await upstream.initialize(params);
+      return cachedInit;
+    },
+    newSession: async (params) => {
+      const res = await upstream.newSession(params);
+      subscribe(res.sessionId, conn);
+      return res;
+    },
+    loadSession: async (params) => {
+      subscribe(params.sessionId, conn);
+      const res = await upstream.loadSession(params);
+      // Replay buffered notifications before the loadSession replay arrives,
+      // so the browser sees recent activity immediately. loadSession provides
+      // the authoritative full history from goosed.
+      const buf = buffers.get(params.sessionId);
+      if (buf) for (const n of buf) conn._agent.extNotification(n.method, n.params);
+      return res;
+    },
+    // THE CORE: prompt is forwarded to the gateway's own upstream client.
+    // The await lives in this process — browser disconnect does NOT abort it.
+    prompt: fwd('prompt'),
+    cancel: fwd('cancel'),
+    listSessions: fwd('listSessions'),
+    unstable_forkSession: fwd('unstable_forkSession'),
+    unstable_closeSession: fwd('unstable_closeSession'),
+    unstable_resumeSession: fwd('unstable_resumeSession'),
+    unstable_setSessionModel: fwd('unstable_setSessionModel'),
+    setSessionMode: fwd('setSessionMode'),
+    setSessionConfigOption: fwd('setSessionConfigOption'),
+    authenticate: fwd('authenticate'),
+    // goose extensions + any unknown method → forward generically
+    extMethod: (method, params) => upstream.extMethod(method, params),
+    extNotification: (method, params) => upstream.extNotification(method, params),
+  };
 }
 
-// --- Downstream (clients) ---------------------------------------------------
+// --- Downstream server (browser → gateway) ----------------------------------
 
 const wss = new WebSocketServer({
   port: GATEWAY_PORT,
-  perMessageDeflate: {
-    threshold: 1024,
-    serverNoContextTakeover: true,
-    clientNoContextTakeover: true,
-  },
+  perMessageDeflate: { threshold: 1024, serverNoContextTakeover: true, clientNoContextTakeover: true },
 });
 
 wss.on('connection', (ws) => {
-  clients.add(ws);
-  console.log(`[gateway] Client connected (${clients.size} total)`);
-
-  ws.on('message', (data) => {
-    const str = data.toString();
-    let msg;
-    try {
-      msg = JSON.parse(str);
-    } catch {
-      sendUpstream(str);
-      return;
-    }
-
-    // Track request ownership for response routing.
-    if (msg.id !== undefined && msg.method) {
-      requestOwner.set(msg.id, ws);
-    }
-
-    // Intercept initialize: goosed only accepts one per WS connection.
-    // On reconnect, respond with the cached result.
-    if (msg.method === 'initialize') {
-      if (initResponse) {
-        ws.send(JSON.stringify({ ...initResponse, id: msg.id }));
-        requestOwner.delete(msg.id);
-        return;
-      }
-      // First time — forward to goosed (response will be cached upstream).
-    }
-
-    sendUpstream(str);
-  });
+  const stream = createDownstreamStream(ws);
+  const conn = { _closed: false };
+  const agent = createDownstreamAgent(conn);
+  conn._agent = new AgentSideConnection(() => agent, stream);
 
   ws.on('close', () => {
-    clients.delete(ws);
-    // Clean up any pending requests owned by this client.
-    for (const [id, owner] of requestOwner) {
-      if (owner === ws) requestOwner.delete(id);
-    }
-    console.log(`[gateway] Client disconnected (${clients.size} remaining) — upstream kept alive`);
+    conn._closed = true;
+    unsubscribeAll(conn);
+    console.log(`[gateway] browser disconnected (subscribers: ${subscribers.size} sessions)`);
   });
+  ws.on('error', () => { conn._closed = true; });
 
-  ws.on('error', () => {
-    clients.delete(ws);
-  });
+  console.log('[gateway] browser connected');
 });
 
-console.log(`[gateway] Listening on :${GATEWAY_PORT} (deflate) → goosed ${GOOSED_HOST}:${GOOSED_PORT}`);
+wss.on('listening', () => {
+  connectUpstream();
+  console.log(`[gateway] Listening on :${GATEWAY_PORT} (deflate) → goosed ${GOOSED_HOST}:${GOOSED_PORT}`);
+});

@@ -18,24 +18,15 @@ const ACP_TOKEN = import.meta.env.VITE_GOOSE_TOKEN ?? '';
 const WORKING_DIR =
   (import.meta.env.VITE_GOOSE_WORKING_DIR as string | undefined) ?? '/root';
 
-// The ACP WebSocket is served same-origin as the page and proxied to goosed by
-// Vite (see vite.config.ts server.proxy). Deriving from window.location makes
-// it work for local (http://localhost:39248) and domain
-// (https://goose.apeiria.cn) access alike.
-// The ACP WebSocket goes through the gateway (default :39249), which adds
-// permessage-deflate compression and keeps the goosed connection alive when
-// the browser disconnects (so in-flight prompts are not aborted).
-// In production behind a reverse proxy, set VITE_GATEWAY_PORT to the same
-// port as the web UI so the URL is same-origin.
+// The ACP WebSocket is same-origin as the page and proxied to the gateway
+// (:39249) by Vite (see vite.config.ts server.proxy). The gateway is a
+// persistent ACP client to goosed, so an in-flight prompt survives a browser
+// disconnect. Deriving from window.location works for local and domain access.
+// The secret token is passed as ?token= because browsers cannot set custom
+// headers on a WebSocket handshake (goosed accepts ?token= per auth.rs).
 function acpWebSocketUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const gwPort = import.meta.env.VITE_GATEWAY_PORT ?? '39249';
-  // If the gateway runs on the same port as the web UI (reverse proxy), use
-  // the same host:port; otherwise use the gateway port explicitly.
-  if (gwPort === window.location.port || gwPort === 'same') {
-    return `${proto}://${window.location.host}/acp`;
-  }
-  return `${proto}://${window.location.hostname}:${gwPort}/acp`;
+  return `${proto}://${window.location.host}/acp?token=${encodeURIComponent(ACP_TOKEN)}`;
 }
 
 // ---------------------------------------------------------------------------
