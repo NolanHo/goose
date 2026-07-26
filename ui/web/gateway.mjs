@@ -205,13 +205,13 @@ function connectUpstream() {
     extNotification(method, params) {
       if (method === '_goose/unstable/session/update') {
         const sid = params?.sessionId;
-        if (sid) routeNotification(sid, 'goose/sessionUpdate', params);
+        if (sid) routeNotification(sid, method, params);
       }
     },
     extMethod(method, params) {
       if (method === '_goose/unstable/session/recipe/request-params') {
         return routeRequest(params?.sessionId, (agent) =>
-          agent.extMethod('goose/sessionRecipeRequestParams', params)
+          agent.extMethod(method, params)
         );
       }
       throw new Error(`unhandled ext method: ${method}`);
