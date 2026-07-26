@@ -222,6 +222,17 @@ function createAcpChatSessionStoreInternal(): AcpChatSessionStoreInternal {
     // fast path above skips message copies while loading).
     entry.messages = entry.adapter.getMessages();
     retainPendingLocalSteerMessageIds(entry);
+    // On page refresh, activePromptAttemptId is null (it's in-memory only).
+    // Detect an in-flight prompt: if the last message is a user message with
+    // no assistant reply yet, goosed's prompt is still running on the gateway.
+    // Generate a "resumed-" prefix ID so we can later detect and clean it up
+    // when goosed sends activeRunId=null (prompt finished).
+    if (!entry.activePromptAttemptId) {
+      const lastMessage = entry.messages[entry.messages.length - 1];
+      if (lastMessage && lastMessage.role === 'user') {
+        entry.activePromptAttemptId = `resumed-${Date.now()}`;
+      }
+    }
     entry.chatState = entry.activePromptAttemptId ? ChatState.Streaming : ChatState.Idle;
     return notify(sessionId, entry);
   };
@@ -644,6 +655,17 @@ function applyChatStateChanges(entry: StoreEntry, changes: AcpChatStateChange[])
         }
         if (change.activeRunId !== undefined) {
           entry.activeRunId = change.activeRunId;
+          // Prompt completed: goosed sends activeRunId=null when the prompt
+          // finishes. For resumed prompts (page refresh), there's no
+          // acpPromptSession promise to call finishPromptAttemptIfCurrent —
+          // clean up the streaming state here.
+          if (
+            change.activeRunId === null &&
+            entry.activePromptAttemptId?.startsWith('resumed-')
+          ) {
+            entry.activePromptAttemptId = null;
+            entry.chatState = ChatState.Idle;
+          }
         }
         break;
       case 'localSteerConfirmed':

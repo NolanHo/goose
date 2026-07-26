@@ -5,7 +5,7 @@ import type {
 } from '@agentclientprotocol/sdk';
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Message } from '../../types/message';
+import type { Message, Role } from '../../types/message';
 import { ChatState } from '../../types/chatState';
 import type { Session } from '../../types/session';
 import {
@@ -16,10 +16,10 @@ import {
   useAcpChatSessionSnapshot,
 } from '../chatSessionStore';
 
-function message(id: string, text: string): Message {
+function message(id: string, text: string, role: Role = 'user'): Message {
   return {
     id,
-    role: 'user',
+    role,
     created: 123,
     content: [{ type: 'text', text }],
     metadata: { userVisible: true, agentVisible: true },
@@ -200,7 +200,7 @@ describe('acpChatSessionStore', () => {
 
   it('finishes session load with session metadata', () => {
     const currentSessionId = sessionId('session-1');
-    const initialMessage = message('message-1', 'Hello');
+    const initialMessage = message('message-1', 'Hello', 'assistant');
 
     acpChatSessionActions.setMessages(currentSessionId, [initialMessage]);
 
@@ -213,6 +213,43 @@ describe('acpChatSessionStore', () => {
     expect(snapshot.messages).toEqual([initialMessage]);
     expect(snapshot.chatState).toBe(ChatState.Idle);
     expect(snapshot.sessionLoadError).toBeUndefined();
+  });
+
+  it('detects in-flight prompt on session load (page refresh)', () => {
+    // Simulate a page refresh: the last message is a user message with no
+    // assistant reply yet — goosed's prompt is still running on the gateway.
+    const currentSessionId = sessionId('session-refresh');
+    const userMsg = message('msg-1', 'Run the tests');
+    acpChatSessionActions.setMessages(currentSessionId, [userMsg]);
+
+    const snapshot = acpChatSessionActions.finishSessionLoad(
+      currentSessionId,
+      session(currentSessionId)
+    );
+
+    expect(snapshot.chatState).toBe(ChatState.Streaming);
+    expect(snapshot.activePromptAttemptId).toMatch(/^resumed-/);
+  });
+
+  it('clears resumed streaming when goosed signals prompt completion', () => {
+    const currentSessionId = sessionId('session-resumed');
+    const userMsg = message('msg-1', 'Run the tests');
+    acpChatSessionActions.setMessages(currentSessionId, [userMsg]);
+    acpChatSessionActions.finishSessionLoad(currentSessionId, session(currentSessionId));
+
+    // goosed sends session_info_update with activeRunId=null when prompt finishes
+    acpChatSessionActions.applyAcpSessionNotification({
+      sessionId: currentSessionId,
+      update: {
+        sessionUpdate: 'session_info_update',
+        title: undefined,
+        _meta: { goose: { activeRunId: null } },
+      },
+    } as unknown as SessionNotification);
+
+    const snapshot = acpChatSessionStore.getSnapshot(currentSessionId);
+    expect(snapshot?.chatState).toBe(ChatState.Idle);
+    expect(snapshot?.activePromptAttemptId).toBeNull();
   });
 
   it('keeps multiple session snapshots isolated', () => {
