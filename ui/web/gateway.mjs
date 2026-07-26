@@ -31,6 +31,7 @@
 
 import wsPkg from '/vePFS-Mindverse/user/nolanho/code/goose/ui/node_modules/ws/index.js';
 const { WebSocketServer } = wsPkg;
+import { createServer, get as httpGet } from 'http';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -58,6 +59,8 @@ loadEnv();
 const GOOSED_HOST = process.env.VITE_GOOSE_ACP_HOST || 'localhost';
 const GOOSED_PORT = process.env.VITE_GOOSE_ACP_PORT || '39247';
 const TOKEN = process.env.VITE_GOOSE_TOKEN || '';
+
+// httpGet is imported from 'http' at the top of the file.
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || '39249', 10);
 const BUFFER_LIMIT = 500; // max notifications buffered per session
 
@@ -293,8 +296,27 @@ function createDownstreamAgent(conn) {
 
 // --- Downstream server (browser → gateway) ----------------------------------
 
+// HTTP layer: forward /health and /status to goosed so the frontend only
+// needs to know one address (the gateway). Other paths return 404.
+const httpServer = createServer((req, res) => {
+  const path = req.url?.split('?')[0];
+  if (path === '/health' || path === '/status') {
+    const proxyReq = httpGet(`http://${GOOSED_HOST}:${GOOSED_PORT}${path}`, (upRes) => {
+      res.writeHead(upRes.statusCode || 200, upRes.headers);
+      upRes.pipe(res);
+    });
+    proxyReq.on('error', () => {
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'goosed unreachable' }));
+    });
+  } else {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  }
+});
+
 const wss = new WebSocketServer({
-  port: GATEWAY_PORT,
+  server: httpServer,
   perMessageDeflate: { threshold: 1024, serverNoContextTakeover: true, clientNoContextTakeover: true },
 });
 
@@ -316,5 +338,7 @@ wss.on('connection', (ws) => {
 
 wss.on('listening', () => {
   connectUpstream();
-  console.log(`[gateway] Listening on :${GATEWAY_PORT} (deflate) → goosed ${GOOSED_HOST}:${GOOSED_PORT}`);
+  console.log(`[gateway] Listening on :${GATEWAY_PORT} (HTTP + WS deflate) → goosed ${GOOSED_HOST}:${GOOSED_PORT}`);
 });
+
+httpServer.listen(GATEWAY_PORT);

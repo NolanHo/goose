@@ -28,13 +28,13 @@ export default defineConfig({
     strictPort: true,
     // Allow access via reverse proxy / custom hostnames (e.g. goose.apeiria.cn).
     allowedHosts: true,
-    // Proxy routes to goosed (:39247) and the ACP gateway (:39249).
+    // Proxy routes through the ACP gateway (:39249) — the single entry point.
     //   /acp    — WebSocket through the gateway (persistent ACP client).
-    //   /health, /status — plain HTTP, no token required by goosed.
+    //   /health, /status — HTTP forwarded to goosed by the gateway.
     proxy: {
       '/acp': { target: 'ws://localhost:39249', ws: true },
-      '/health': 'http://localhost:39247',
-      '/status': 'http://localhost:39247',
+      '/health': 'http://localhost:39249',
+      '/status': 'http://localhost:39249',
     },
   },
 
