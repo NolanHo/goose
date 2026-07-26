@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react';
+import { memo, useMemo, useRef } from 'react';
 import ImagePreview from './ImagePreview';
 import { formatMessageTimestamp } from '../utils/timeUtils';
 import MarkdownContent from './MarkdownContent';
@@ -38,7 +38,7 @@ interface GooseMessageProps {
   ) => Promise<boolean>;
 }
 
-export default function GooseMessage({
+function GooseMessage({
   sessionId,
   message,
   messages,
@@ -239,3 +239,19 @@ export default function GooseMessage({
     </div>
   );
 }
+
+export default memo(GooseMessage, (prev, next) => {
+  // Content changed (streaming) → re-render
+  if (prev.message !== next.message) return false;
+  // Streaming state changed → re-render
+  if (prev.isStreaming !== next.isStreaming) return false;
+  // Messages added/removed (e.g. new tool response message) → re-render
+  if (prev.messages.length !== next.messages.length) return false;
+  // This message's tool call notifications changed (tool progress) → re-render
+  for (const req of getToolRequests(prev.message)) {
+    const prevCount = prev.toolCallNotifications.get(req.id)?.length ?? 0;
+    const nextCount = next.toolCallNotifications.get(req.id)?.length ?? 0;
+    if (prevCount !== nextCount) return false;
+  }
+  return true;
+});
