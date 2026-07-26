@@ -95,22 +95,6 @@ export default function ProgressiveMessageList({
   const hasOnlyToolResponses = (message: Message) =>
     message.content.every((c) => c.type === 'toolResponse');
 
-  const getResolvedModel = useCallback((message: Message): string | null => {
-    if (message.role !== 'assistant' || !message.metadata.userVisible) return null;
-    return message.metadata.inference?.resolvedModel ?? null;
-  }, []);
-
-  const getPreviousResolvedModel = useCallback(
-    (index: number): string | null => {
-      for (let i = index - 1; i >= 0; i--) {
-        const model = getResolvedModel(messages[i]);
-        if (model) return model;
-      }
-      return null;
-    },
-    [getResolvedModel, messages]
-  );
-
   const renderModelChangeDisclosure = useCallback(
     (previousModel: string, currentModel: string) => (
       <SystemNotificationInline
@@ -231,6 +215,25 @@ export default function ProgressiveMessageList({
   // Detect tool call chains
   const toolCallChains = useMemo(() => identifyConsecutiveToolCalls(messages), [messages]);
 
+  // Pre-compute model-change disclosures in a single forward pass (O(n)),
+  // instead of a backward scan per assistant message (O(n²)).
+  const modelChanges = useMemo(() => {
+    const changes = new Map<number, { previousModel: string; currentModel: string }>();
+    let lastResolvedModel: string | null = null;
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== 'assistant' || !msg.metadata.userVisible) continue;
+      const resolved = msg.metadata.inference?.resolvedModel ?? null;
+      if (resolved) {
+        if (lastResolvedModel && lastResolvedModel !== resolved) {
+          changes.set(i, { previousModel: lastResolvedModel, currentModel: resolved });
+        }
+        lastResolvedModel = resolved;
+      }
+    }
+    return changes;
+  }, [messages]);
+
   // Render messages up to the current rendered count
   const renderMessages = useCallback(() => {
     const messagesToRender = messages.slice(0, renderedCount);
@@ -266,13 +269,10 @@ export default function ProgressiveMessageList({
 
         const isUser = isUserMessage(message);
         const messageIsInChain = isInChain(index, toolCallChains);
-        const currentResolvedModel = getResolvedModel(message);
-        const previousResolvedModel = currentResolvedModel ? getPreviousResolvedModel(index) : null;
-        const showModelChangeDisclosure = Boolean(
-          currentResolvedModel &&
-            previousResolvedModel &&
-            currentResolvedModel !== previousResolvedModel
-        );
+        const modelChange = modelChanges.get(index);
+        const showModelChangeDisclosure = Boolean(modelChange);
+        const currentResolvedModel = modelChange?.currentModel;
+        const previousResolvedModel = modelChange?.previousModel;
 
         const messageKey = message.id ?? `msg-${index}-${message.created}`;
 
@@ -321,8 +321,6 @@ export default function ProgressiveMessageList({
     onMessageUpdate,
     toolCallChains,
     submitElicitationResponse,
-    getPreviousResolvedModel,
-    getResolvedModel,
     renderModelChangeDisclosure,
   ]);
 

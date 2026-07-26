@@ -742,10 +742,50 @@ function confirmedLocalSteerTextByMessageId(entry: StoreEntry): Map<string, stri
   return textByMessageId;
 }
 
+/**
+ * Detect whether a message's rendered content changed between snapshots.
+ * Conservative: returns true (changed) when uncertain, so a missed field
+ * never suppresses a needed re-render. Only text/thinking (the streaming
+ * hot path) get field-level comparison; other content types fall back to
+ * structural JSON comparison (low frequency).
+ */
+function messageContentChanged(prev: Message, curr: Message): boolean {
+  if (prev.content.length !== curr.content.length) return true;
+  for (let i = 0; i < prev.content.length; i++) {
+    const p = prev.content[i];
+    const c = curr.content[i];
+    if (p.type !== c.type) return true;
+    if (p.type === 'text' && c.type === 'text') {
+      if (p.text !== c.text) return true;
+    } else if (p.type === 'thinking' && c.type === 'thinking') {
+      if (p.thinking !== c.thinking || p.signature !== c.signature) return true;
+    } else if (JSON.stringify(p) !== JSON.stringify(c)) {
+      return true;
+    }
+  }
+  if (JSON.stringify(prev.metadata) !== JSON.stringify(curr.metadata)) return true;
+  return false;
+}
+
 function snapshotFromEntry(entry: StoreEntry): AcpChatSessionSnapshot {
+  const prevMessages = entry.lastSnapshot?.messages;
+  // Reuse the previous snapshot's message reference when the content hasn't
+  // changed. This keeps stable references for unchanged (historical) messages
+  // so React.memo on message components can skip re-rendering them — only the
+  // actively-streaming message gets a fresh clone each notification.
+  const messages = prevMessages
+    ? (() => {
+        const prevById = new Map(prevMessages.map((m) => [m.id, m]));
+        return entry.messages.map((msg) => {
+          const prev = msg.id ? prevById.get(msg.id) : undefined;
+          if (prev && !messageContentChanged(prev, msg)) return prev;
+          return cloneMessage(msg);
+        });
+      })()
+    : cloneMessages(entry.messages);
   return {
     session: entry.session,
-    messages: cloneMessages(entry.messages),
+    messages,
     tokenState: { ...entry.tokenState },
     notifications: [...entry.notifications],
     progressMessage: entry.progressMessage,
