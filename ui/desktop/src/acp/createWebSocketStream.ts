@@ -11,9 +11,23 @@ export function createWebSocketStream(wsUrl: string): ClosableAcpStream {
   const waiters: Array<() => void> = [];
   let closed = false;
 
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
   function pushMessage(message: unknown): void {
     incoming.push(message);
-    waiters.shift()?.();
+    // Batch: collect messages and flush on the next macrotask tick.
+    // During session-load replay goosed sends thousands of notifications in
+    // ~1s. Without batching, each message wakes pull() individually — the
+    // SDK processes one notification per macrotask, and Chrome's inter-
+    // macrotask overhead (GC, render checks, task scheduling) accumulates
+    // to seconds. With batching, pull() drains the whole batch in one call
+    // and the SDK processes them in a tight microtask chain.
+    if (!flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        waiters.shift()?.();
+      }, 0);
+    }
   }
 
   function waitForMessage(): Promise<void> {
@@ -48,6 +62,10 @@ export function createWebSocketStream(wsUrl: string): ClosableAcpStream {
 
   const closeWaiters = () => {
     closed = true;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
     for (const waiter of waiters) {
       waiter();
     }
