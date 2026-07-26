@@ -87,6 +87,8 @@ const CodeBlock = memo(function CodeBlock({
   const intl = useIntl();
   const [copied, setCopied] = useState(false);
   const timeoutRef = useRef<number | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [inView, setInView] = useState(false);
 
   const handleCopy = async () => {
     try {
@@ -111,16 +113,29 @@ const CodeBlock = memo(function CodeBlock({
     };
   }, []);
 
+  // Lazy syntax highlighting: only run Prism when the code block is near the
+  // viewport. Before that, render a plain <pre><code> (zero Prism cost). This
+  // is the main lever for loadSession first-paint — N code blocks no longer
+  // all highlight synchronously; off-screen ones defer until scrolled near.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || inView) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          setInView(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '200px 0px' }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [inView]);
+
   // Memoize the SyntaxHighlighter component to prevent re-rendering
   // Only re-render if language or children change
-  const memoizedSyntaxHighlighter = useMemo(() => {
-    // For very large code blocks, consider truncating or lazy loading
-    const isLargeCodeBlock = children.length > 10000; // 10KB threshold
-
-    if (isLargeCodeBlock) {
-      console.log(`Large code block detected (${children.length} chars), consider optimization`);
-    }
-
+  const highlighted = useMemo(() => {
     return (
       <SyntaxHighlighter
         style={customOneDarkTheme}
@@ -140,10 +155,9 @@ const CodeBlock = memo(function CodeBlock({
             fontSize: '14px',
           },
         }}
-        // Performance optimizations for SyntaxHighlighter
-        showLineNumbers={false} // Disable line numbers for better performance
-        wrapLines={false} // Disable line wrapping for better performance
-        lineProps={undefined} // Don't add extra props to each line
+        showLineNumbers={false}
+        wrapLines={false}
+        lineProps={undefined}
       >
         {children}
       </SyntaxHighlighter>
@@ -151,7 +165,7 @@ const CodeBlock = memo(function CodeBlock({
   }, [language, children]);
 
   return (
-    <div className="relative group w-full">
+    <div className="relative group w-full" ref={containerRef}>
       <button
         onClick={handleCopy}
         className="absolute right-2 bottom-2 p-1.5 rounded-lg bg-gray-700/50 text-gray-300 font-sans text-sm
@@ -161,7 +175,28 @@ const CodeBlock = memo(function CodeBlock({
       >
         {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
       </button>
-      <div className="w-full overflow-x-auto">{memoizedSyntaxHighlighter}</div>
+      <div className="w-full overflow-x-auto">
+        {inView ? (
+          highlighted
+        ) : (
+          <pre
+            className="w-full"
+            style={{ margin: 0, background: '#282c34', borderRadius: '8px', padding: '12px' }}
+          >
+            <code
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: '14px',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
+                overflowWrap: 'break-word',
+              }}
+            >
+              {children}
+            </code>
+          </pre>
+        )}
+      </div>
     </div>
   );
 });
