@@ -129,6 +129,13 @@ let cachedInit = null;          // cached InitializeResponse
 const subscribers = new Map();
 // session-id → array of buffered session/update notifications (for replay)
 const buffers = new Map();
+// session-id → conn that is currently running loadSession (replay must be
+// unicast to the loader, not fan-out to all subscribers — otherwise other
+// clients on the same session receive duplicate messages).
+const loadingConns = new Map();
+// session-id → conn that initiated the current prompt (permission and
+// elicitation requests should go to the prompter, not an arbitrary subscriber).
+const activePromptConns = new Map();
 
 function subscribe(sessionId, conn) {
   let set = subscribers.get(sessionId);
@@ -150,8 +157,18 @@ function bufferNotification(sessionId, notification) {
   if (buf.length > BUFFER_LIMIT) buf.splice(0, buf.length - BUFFER_LIMIT);
 }
 
-/** Forward a goosed notification to all browsers subscribed to a session. */
+/** Forward a goosed notification to browsers subscribed to a session. */
 function routeNotification(sessionId, method, params) {
+  // During loadSession replay: unicast to the loader only. goosed replays
+  // the entire conversation, and fan-out would duplicate every message for
+  // other clients already viewing the same session.
+  const loader = loadingConns.get(sessionId);
+  if (loader && !loader._closed) {
+    if (method === 'session/update') loader._agent.sessionUpdate(params);
+    else loader._agent.extNotification(method, params);
+    return;
+  }
+
   const subs = subscribers.get(sessionId);
   // Buffer only when no live subscriber exists (the disconnect-window case
   // the buffer is for). Otherwise goosed's own loadSession replay already
@@ -173,6 +190,19 @@ function routeNotification(sessionId, method, params) {
  * return 'cancelled' so the agent isn't blocked forever.
  */
 async function routeRequest(sessionId, fn) {
+  // Prefer the client that initiated the current prompt — permission and
+  // elicitation requests should surface on the prompter's UI, not an
+  // arbitrary subscriber.
+  const prompter = activePromptConns.get(sessionId);
+  if (prompter && !prompter._closed) {
+    try {
+      return await fn(prompter._agent);
+    } catch {
+      return { outcome: { outcome: 'cancelled' } };
+    }
+  }
+
+  // Fallback: route to the first available subscriber.
   const subs = subscribers.get(sessionId);
   if (!subs) return { outcome: { outcome: 'cancelled' } };
   for (const conn of subs) {
@@ -268,16 +298,28 @@ function createDownstreamAgent(conn) {
     },
     loadSession: async (params) => {
       subscribe(params.sessionId, conn);
-      const res = await upstream.loadSession(params);
-      // goosed's loadSession replays the full conversation history itself.
-      // Clear our buffer — it was only for the disconnect window, and
-      // replaying it now would duplicate goosed's authoritative replay.
-      buffers.delete(params.sessionId);
-      return res;
+      loadingConns.set(params.sessionId, conn);
+      try {
+        const res = await upstream.loadSession(params);
+        // goosed's loadSession replays the full conversation history itself.
+        // Clear our buffer — it was only for the disconnect window, and
+        // replaying it now would duplicate goosed's authoritative replay.
+        buffers.delete(params.sessionId);
+        return res;
+      } finally {
+        loadingConns.delete(params.sessionId);
+      }
     },
     // THE CORE: prompt is forwarded to the gateway's own upstream client.
     // The await lives in this process — browser disconnect does NOT abort it.
-    prompt: fwd('prompt'),
+    prompt: async (params) => {
+      activePromptConns.set(params.sessionId, conn);
+      try {
+        return await upstream.prompt(params);
+      } finally {
+        activePromptConns.delete(params.sessionId);
+      }
+    },
     cancel: fwd('cancel'),
     listSessions: fwd('listSessions'),
     unstable_forkSession: fwd('unstable_forkSession'),
